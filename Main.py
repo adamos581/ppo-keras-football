@@ -5,15 +5,17 @@ import numpy as np
 import gym
 
 from keras.models import Model
-from keras.layers import Input, Dense
+from keras.layers import Input, Dense, Flatten
 from keras import backend as K
 from keras.optimizers import Adam
+from keras.applications.mobilenet_v2 import MobileNetV2
 
 import numba as nb
 from tensorboardX import SummaryWriter
 
 ENV = 'LunarLander-v2'
 CONTINUOUS = False
+import gfootball.env as football_env
 
 EPISODES = 100000
 
@@ -23,16 +25,13 @@ NOISE = 1.0 # Exploration noise
 
 GAMMA = 0.99
 
-BUFFER_SIZE = 2048
+BUFFER_SIZE = 255
 BATCH_SIZE = 256
-NUM_ACTIONS = 4
-NUM_STATE = 8
 HIDDEN_SIZE = 128
 NUM_LAYERS = 2
 ENTROPY_LOSS = 5e-3
 LR = 1e-4  # Lower lr stabilises training greatly
 
-DUMMY_ACTION, DUMMY_VALUE = np.zeros((1, NUM_ACTIONS)), np.zeros((1, 1))
 
 
 @nb.jit
@@ -48,32 +47,16 @@ def proximal_policy_optimization_loss(advantage, old_prediction):
         return -K.mean(K.minimum(r * advantage, K.clip(r, min_value=1 - LOSS_CLIPPING, max_value=1 + LOSS_CLIPPING) * advantage) + ENTROPY_LOSS * -(prob * K.log(prob + 1e-10)))
     return loss
 
-
-def proximal_policy_optimization_loss_continuous(advantage, old_prediction):
-    def loss(y_true, y_pred):
-        var = K.square(NOISE)
-        pi = 3.1415926
-        denom = K.sqrt(2 * pi * var)
-        prob_num = K.exp(- K.square(y_true - y_pred) / (2 * var))
-        old_prob_num = K.exp(- K.square(y_true - old_prediction) / (2 * var))
-
-        prob = prob_num/denom
-        old_prob = old_prob_num/denom
-        r = prob/(old_prob + 1e-10)
-
-        return -K.mean(K.minimum(r * advantage, K.clip(r, min_value=1 - LOSS_CLIPPING, max_value=1 + LOSS_CLIPPING) * advantage))
-    return loss
-
-
 class Agent:
     def __init__(self):
-        self.critic = self.build_critic()
-        if CONTINUOUS is False:
-            self.actor = self.build_actor()
-        else:
-            self.actor = self.build_actor_continuous()
 
-        self.env = gym.make(ENV)
+        self.env = football_env.create_environment(env_name='academy_empty_goal', representation='pixels', render=True)
+        self.state_dims = self.env.observation_space.shape
+        self.n_actions = self.env.action_space.n
+
+        self.actor = self.build_actor(self.state_dims, self.n_actions, self.n_actions)
+        self.critic = self.build_critic(self.state_dims)
+
         print(self.env.action_space, 'action_space', self.env.observation_space, 'observation_space')
         self.episode = 0
         self.observation = self.env.reset()
@@ -84,6 +67,8 @@ class Agent:
         self.writer = SummaryWriter(self.name)
         self.gradient_steps = 0
 
+        self.dummy_action, self.dummy_value = np.zeros((1, self.n_actions)), np.zeros((1, 1))
+
     def get_name(self):
         name = 'AllRuns/'
         if CONTINUOUS is True:
@@ -93,58 +78,47 @@ class Agent:
         name += ENV
         return name
 
-    def build_actor(self):
-        state_input = Input(shape=(NUM_STATE,))
+    def build_actor(self, input_dims, output_dims, n_actions):
+        state_input = Input(shape=input_dims)
         advantage = Input(shape=(1,))
-        old_prediction = Input(shape=(NUM_ACTIONS,))
+        old_prediction = Input(shape=(output_dims,))
 
-        x = Dense(HIDDEN_SIZE, activation='tanh')(state_input)
-        for _ in range(NUM_LAYERS - 1):
-            x = Dense(HIDDEN_SIZE, activation='tanh')(x)
+        feature_extractor = MobileNetV2(include_top=False, weights='imagenet')
 
-        out_actions = Dense(NUM_ACTIONS, activation='softmax', name='output')(x)
+        for layer in feature_extractor.layers:
+            layer.trainable = False
 
-        model = Model(inputs=[state_input, advantage, old_prediction], outputs=[out_actions])
-        model.compile(optimizer=Adam(lr=LR),
-                      loss=[proximal_policy_optimization_loss(
+        # Classification block
+        x = Flatten(name='flatten')(feature_extractor(state_input))
+        x = Dense(1024, activation='relu', name='fc1')(x)
+        out_actions = Dense(n_actions, activation='softmax', name='predictions')(x)
+
+        model = Model(inputs=[state_input, old_prediction, advantage],
+                      outputs=[out_actions])
+        model.compile(optimizer=Adam(lr=1e-4), loss=[proximal_policy_optimization_loss(
                           advantage=advantage,
                           old_prediction=old_prediction)])
         model.summary()
-
         return model
 
-    def build_actor_continuous(self):
-        state_input = Input(shape=(NUM_STATE,))
-        advantage = Input(shape=(1,))
-        old_prediction = Input(shape=(NUM_ACTIONS,))
 
-        x = Dense(HIDDEN_SIZE, activation='tanh')(state_input)
-        for _ in range(NUM_LAYERS - 1):
-            x = Dense(HIDDEN_SIZE, activation='tanh')(x)
+    def build_critic(self, input_dims):
 
-        out_actions = Dense(NUM_ACTIONS, name='output', activation='tanh')(x)
+        state_input = Input(shape=input_dims)
 
-        model = Model(inputs=[state_input, advantage, old_prediction], outputs=[out_actions])
-        model.compile(optimizer=Adam(lr=LR),
-                      loss=[proximal_policy_optimization_loss_continuous(
-                          advantage=advantage,
-                          old_prediction=old_prediction)])
+        feature_extractor = MobileNetV2(include_top=False, weights='imagenet')
+
+        for layer in feature_extractor.layers:
+            layer.trainable = False
+
+        # Classification block
+        x = Flatten(name='flatten')(feature_extractor(state_input))
+        x = Dense(1024, activation='relu', name='fc1')(x)
+        out_actions = Dense(1, activation='tanh')(x)
+
+        model = Model(inputs=[state_input], outputs=[out_actions])
+        model.compile(optimizer=Adam(lr=1e-4), loss='mse')
         model.summary()
-
-        return model
-
-    def build_critic(self):
-
-        state_input = Input(shape=(NUM_STATE,))
-        x = Dense(HIDDEN_SIZE, activation='tanh')(state_input)
-        for _ in range(NUM_LAYERS - 1):
-            x = Dense(HIDDEN_SIZE, activation='tanh')(x)
-
-        out_value = Dense(1)(x)
-
-        model = Model(inputs=[state_input], outputs=[out_value])
-        model.compile(optimizer=Adam(lr=LR), loss='mse')
-
         return model
 
     def reset_env(self):
@@ -157,22 +131,16 @@ class Agent:
         self.reward = []
 
     def get_action(self):
-        p = self.actor.predict([self.observation.reshape(1, NUM_STATE), DUMMY_VALUE, DUMMY_ACTION])
+
+        p = self.actor.predict([np.expand_dims(self.observation, 0),self.dummy_action, self.dummy_value])
+        print(p)
         if self.val is False:
 
-            action = np.random.choice(NUM_ACTIONS, p=np.nan_to_num(p[0]))
+            action = np.random.choice(self.n_actions, p=np.nan_to_num(p[0]))
         else:
             action = np.argmax(p[0])
-        action_matrix = np.zeros(NUM_ACTIONS)
+        action_matrix = np.zeros(self.n_actions)
         action_matrix[action] = 1
-        return action, action_matrix, p
-
-    def get_action_continuous(self):
-        p = self.actor.predict([self.observation.reshape(1, NUM_STATE), DUMMY_VALUE, DUMMY_ACTION])
-        if self.val is False:
-            action = action_matrix = p[0] + np.random.normal(loc=0, scale=NOISE, size=p[0].shape)
-        else:
-            action = action_matrix = p[0]
         return action, action_matrix, p
 
     def transform_reward(self):
@@ -188,10 +156,8 @@ class Agent:
 
         tmp_batch = [[], [], []]
         while len(batch[0]) < BUFFER_SIZE:
-            if CONTINUOUS is False:
-                action, action_matrix, predicted_action = self.get_action()
-            else:
-                action, action_matrix, predicted_action = self.get_action_continuous()
+            action, action_matrix, predicted_action = self.get_action()
+
             observation, reward, done, info = self.env.step(action)
             self.reward.append(reward)
 
@@ -226,8 +192,8 @@ class Agent:
 
             advantage = reward - pred_values
 
-            actor_loss = self.actor.fit([obs, advantage, old_prediction], [action], batch_size=BATCH_SIZE, shuffle=True, epochs=EPOCHS, verbose=False)
-            critic_loss = self.critic.fit([obs], [reward], batch_size=BATCH_SIZE, shuffle=True, epochs=EPOCHS, verbose=False)
+            actor_loss = self.actor.fit([obs, old_prediction, advantage], [action], batch_size=BATCH_SIZE, shuffle=True, epochs=EPOCHS, verbose=True)
+            critic_loss = self.critic.fit([obs], [reward], batch_size=BATCH_SIZE, shuffle=True, epochs=EPOCHS, verbose=True)
             self.writer.add_scalar('Actor loss', actor_loss.history['loss'][-1], self.gradient_steps)
             self.writer.add_scalar('Critic loss', critic_loss.history['loss'][-1], self.gradient_steps)
 
