@@ -133,7 +133,7 @@ class Agent:
     def get_action(self):
 
         p = self.actor.predict([np.expand_dims(self.observation, 0),self.dummy_action, self.dummy_value])
-        print(p)
+        
         if self.val is False:
 
             action = np.random.choice(self.n_actions, p=np.nan_to_num(p[0]))
